@@ -27,14 +27,28 @@ This design follows the normalizing-flow line of work behind
 it here is that each head only models a 16-dimensional token, where expressive
 spline flows are cheap and avoid the multi-step diffusion sampler.
 
+Recent adjacent work points in a similar direction:
+[TarFlow](https://arxiv.org/abs/2412.06329) and
+[STARFlow](https://arxiv.org/abs/2506.06276) scale transformer autoregressive
+flows for images; [Jet](https://arxiv.org/abs/2412.15129) revisits
+transformer-based flows; [Show-o2](https://arxiv.org/abs/2506.15564) and
+[TMD](https://arxiv.org/abs/2601.09881) attach flow heads to larger
+multimodal or diffusion backbones. I did not find a public paper that matches
+this repo's exact setup: one conditional spline-flow head per 16-D SphereAR
+token.
+
 The flow path does not use classifier-free guidance. Use sampling temperature to
-trade diversity for sharpness:
+trade diversity for sharpness, and optionally anneal it across token positions:
 
 ```text
 temperature < 1.0  lower diversity, often cleaner samples
 temperature = 1.0  base sampling
 temperature > 1.0  higher diversity, often noisier samples
+temperature_schedule = constant | linear
 ```
+
+This repo keeps the original diffusion CFG path as the baseline; the linear CFG
+schedule is still the default there.
 
 ## Environment
 
@@ -91,6 +105,13 @@ Useful flow options:
 --flow-base-scale-bound    clamp range for conditional base log-scale
 ```
 
+Sampling options:
+
+```text
+--temperature
+--temperature-schedule
+```
+
 Checkpoints are written to `last.pt`, with `prev.pt` and periodic
 `epoch_*.pt` snapshots.
 
@@ -106,7 +127,7 @@ sample_dir=/path/to/samples
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
 sample_ddp.py --model SphereAR-B --head-type flow --ckpt $ckpt \
 --sample-dir $sample_dir --per-proc-batch-size 256 \
---temperature 0.9 --to-npz
+--temperature 0.9 --temperature-schedule constant --to-npz
 ```
 
 The script writes PNGs first and, with `--to-npz`, converts the first 50,000
@@ -116,7 +137,7 @@ images into:
 $sample_dir/<run-name>.npz
 ```
 
-Try temperatures such as `0.7`, `0.8`, `0.9`, and `1.0` for FID sweeps.
+Try temperatures such as `0.7`, `0.8`, `0.9`, and `1.0`.
 
 ## Evaluate
 
@@ -136,6 +157,27 @@ python evaluator.py VIRTUAL_imagenet256_labeled.npz /path/to/generated.npz
 The evaluator reports Inception Score, FID, sFID, Precision, and Recall, and
 writes the metrics next to the generated `.npz`.
 
+## Train Preview
+
+Training does not run FID. It periodically saves a small preview batch to:
+
+```text
+$result_path/train_samples/step_xxxxxxx/
+```
+
+Useful preview options:
+
+```text
+--preview-every-steps
+--preview-num-samples
+--preview-sample-steps
+--preview-temperature
+--preview-temperature-schedule
+```
+
+Preview sampling follows the same head-specific rules as full sampling: flow
+uses temperature, diffusion uses CFG.
+
 ## Diffusion Head Baseline
 
 The original head is still available:
@@ -144,13 +186,15 @@ The original head is still available:
 --head-type diff
 ```
 
-Diffusion sampling continues to use `--cfg-scale` and `--sample-steps`.
+Diffusion sampling continues to use `--cfg-scale` and `--sample-steps`, with
+the original linear CFG schedule kept in code.
 
 ## Notes
 
 - Flow checkpoints are not shape-compatible with diffusion-head checkpoints.
 - EMA sampling is enabled by default when the checkpoint contains `ema`; use
   `--no-ema` to sample raw weights.
-- A stricter future variant is a spherical flow: map each token to a tangent
-  space with a log map, run the conditional flow there, and map back to the
-  hypersphere with an exp map. This is not implemented here.
+- A stricter future variant is a spherical flow on the latent manifold itself:
+  map each token to a tangent chart, run the conditional flow there, and map
+  back with the inverse chart or exp map. This is the more principled way to
+  match the VAE's spherical latent support, but it is not implemented here.

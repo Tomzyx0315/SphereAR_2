@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid, save_image
 
 from SphereAR.dataset import build_dataset
 from SphereAR.gan.gan_loss import GANLoss
@@ -161,6 +162,64 @@ def update_loss_dict(running_loss_dict, **kwargs):
                 v = v.item()
             running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
     return running_loss_dict
+
+
+def build_preview_class_ids(args):
+    if args.preview_num_samples <= 0:
+        return None
+    g = torch.Generator(device="cpu")
+    g.manual_seed(args.global_seed + 12345)
+    return torch.randint(
+        0,
+        args.num_classes,
+        (args.preview_num_samples,),
+        generator=g,
+        dtype=torch.long,
+    )
+
+
+@torch.no_grad()
+def save_preview_samples(
+    sample_model,
+    class_ids,
+    preview_root,
+    train_steps,
+    args,
+    device,
+    ptdtype,
+    logger,
+):
+    step_dir = os.path.join(preview_root, f"step_{train_steps:07d}")
+    os.makedirs(step_dir, exist_ok=True)
+
+    was_training = sample_model.training
+    sample_model.eval()
+    with torch.amp.autocast("cuda", dtype=ptdtype):
+        samples = sample_model.sample(
+            class_ids.to(device, non_blocking=True),
+            sample_steps=args.preview_sample_steps,
+            cfg_scale=args.preview_cfg_scale,
+            temperature=args.preview_temperature,
+            temperature_schedule=args.preview_temperature_schedule,
+        )
+
+    grid = make_grid(
+        samples,
+        nrow=min(4, samples.shape[0]),
+        normalize=True,
+        value_range=(-1, 1),
+    )
+    save_image(grid, os.path.join(step_dir, "grid.png"))
+    for idx, sample in enumerate(samples):
+        save_image(
+            sample,
+            os.path.join(step_dir, f"{idx:02d}.png"),
+            normalize=True,
+            value_range=(-1, 1),
+        )
+
+    sample_model.train(was_training)
+    logger.info(f"saved preview samples to {step_dir}")
 
 
 def vae_loss(
@@ -396,6 +455,8 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs ({total_steps} steps)")
     tsb_writer = SummaryWriter(log_dir=results_dir) if rank == 0 else None
+    preview_class_ids = build_preview_class_ids(args) if rank == 0 else None
+    preview_root = os.path.join(results_dir, "train_samples")
 
     for epoch in range(start_epoch, args.epochs):
         loader = create_dataloader(dataset, sampler, epoch, args)
@@ -481,6 +542,23 @@ def main(args):
                 log_steps = 0
                 start_time = time.time()
 
+            if (
+                rank == 0
+                and args.preview_every_steps > 0
+                and train_steps % args.preview_every_steps == 0
+                and preview_class_ids is not None
+            ):
+                save_preview_samples(
+                    get_orig_model(model),
+                    preview_class_ids,
+                    preview_root,
+                    train_steps,
+                    args,
+                    device,
+                    ptdtype,
+                    logger,
+                )
+
         # save checkpoint at the end of each epoch
         if rank == 0:
             checkpoint = {
@@ -545,6 +623,17 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--preview-every-steps", type=int, default=1000)
+    parser.add_argument("--preview-num-samples", type=int, default=16)
+    parser.add_argument("--preview-sample-steps", type=int, default=32)
+    parser.add_argument("--preview-cfg-scale", type=float, default=1.0)
+    parser.add_argument("--preview-temperature", type=float, default=0.9)
+    parser.add_argument(
+        "--preview-temperature-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+    )
     parser.add_argument(
         "--mixed-precision", type=str, default="bf16", choices=["none", "bf16"]
     )

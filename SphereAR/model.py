@@ -266,11 +266,22 @@ class SphereAR(nn.Module):
         cfg_scale,
         cfg_schedule="linear",
         temperature=1.0,
+        temperature_schedule="constant",
     ):
         x = x + self.pos_for_diff.weight[diff_pos : diff_pos + 1, :]
         x = x.view(-1, x.shape[-1])
         if self.head_type == "flow":
-            pred = self.head.sample(x, temperature=temperature)
+            seq_len = self.h * self.w
+            if temperature_schedule == "constant":
+                temp_iter = temperature
+            elif temperature_schedule == "linear":
+                start = 1.0
+                temp_iter = start + (temperature - start) * diff_pos / seq_len
+            else:
+                raise NotImplementedError(
+                    f"unknown temperature_schedule {temperature_schedule}"
+                )
+            pred = self.head.sample(x, temperature=temp_iter)
         else:
             seq_len = self.h * self.w
             if cfg_scale > 1.0:
@@ -297,6 +308,7 @@ class SphereAR(nn.Module):
         cfg_scale=1.0,
         cfg_schedule="linear",
         temperature=1.0,
+        temperature_schedule="constant",
     ):
         self.eval()
         use_cfg = self.head_type == "diff" and cfg_scale > 1.0
@@ -327,6 +339,7 @@ class SphereAR(nn.Module):
                 cfg_scale,
                 cfg_schedule,
                 temperature,
+                temperature_schedule,
             )
             all_preds.append(last_pred)
 

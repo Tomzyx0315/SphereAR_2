@@ -72,7 +72,7 @@ def main(args):
         os.path.basename(args.ckpt).replace(".pth", "").replace(".pt", "")
     )
     if args.head_type == "flow":
-        sampling_tag = f"temp-{args.temperature}"
+        sampling_tag = f"temp-{args.temperature}-{args.temperature_schedule}"
     else:
         sampling_tag = f"steps-{args.sample_steps}-cfg-{args.cfg_scale}"
     folder_name = (
@@ -122,6 +122,7 @@ def main(args):
                 sample_steps=args.sample_steps,
                 cfg_scale=args.cfg_scale,
                 temperature=args.temperature,
+                temperature_schedule=args.temperature_schedule,
             )
 
         samples = (
@@ -160,6 +161,12 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=99)
     parser.add_argument("--sample-steps", type=int, default=100)
+    parser.add_argument(
+        "--temperature-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+    )
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument(
         "--mixed-precision", type=str, default="bf16", choices=["none", "bf16"]
