@@ -71,9 +71,13 @@ def main(args):
     ckpt_string_name = (
         os.path.basename(args.ckpt).replace(".pth", "").replace(".pt", "")
     )
+    if args.head_type == "flow":
+        sampling_tag = f"temp-{args.temperature}"
+    else:
+        sampling_tag = f"steps-{args.sample_steps}-cfg-{args.cfg_scale}"
     folder_name = (
-        f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-"
-        f"steps-{args.sample_steps}-cfg-{args.cfg_scale}-seed-{args.seed}"
+        f"{model_string_name}-{args.head_type}-{ckpt_string_name}-"
+        f"size-{args.image_size}-{sampling_tag}-seed-{args.seed}"
     )
     if not args.no_ema:
         folder_name += "-ema"
@@ -117,6 +121,7 @@ def main(args):
                 c_indices,
                 sample_steps=args.sample_steps,
                 cfg_scale=args.cfg_scale,
+                temperature=args.temperature,
             )
 
         samples = (
@@ -152,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples", type=int, default=50000)
     parser.add_argument("--cfg-scale", type=float, default=4.6)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=99)
     parser.add_argument("--sample-steps", type=int, default=100)
     parser.add_argument("--no-ema", action="store_true")

@@ -3,10 +3,10 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .diff_head import DiffHead
+from .flow_head import FlowHead
 from .layers import TransformerBlock, get_2d_pos, precompute_freqs_cis_2d
 from .vae import VAE
 
@@ -22,7 +22,15 @@ def get_model_args():
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cls-token-num", type=int, default=16)
     parser.add_argument("--latent-dim", type=int, default=16)
+    parser.add_argument("--head-type", type=str, default="diff", choices=["diff", "flow"])
     parser.add_argument("--diff-batch-mul", type=int, default=4)
+    parser.add_argument("--flow-layers", type=int, default=8)
+    parser.add_argument("--flow-bins", type=int, default=16)
+    parser.add_argument("--flow-hidden-mul", type=float, default=1.0)
+    parser.add_argument("--flow-conditioner-depth", type=int, default=2)
+    parser.add_argument("--flow-tail-bound", type=float, default=6.0)
+    parser.add_argument("--flow-noise-std", type=float, default=0.01)
+    parser.add_argument("--flow-base-scale-bound", type=float, default=2.0)
     parser.add_argument("--grad-checkpointing", action="store_true")
     return parser
 
@@ -33,7 +41,15 @@ def create_model(args, device):
         patch_size=args.patch_size,
         latent_dim=args.latent_dim,
         vae_only=args.vae_only,
+        head_type=args.head_type,
         diff_batch_mul=args.diff_batch_mul,
+        flow_layers=args.flow_layers,
+        flow_bins=args.flow_bins,
+        flow_hidden_mul=args.flow_hidden_mul,
+        flow_conditioner_depth=args.flow_conditioner_depth,
+        flow_tail_bound=args.flow_tail_bound,
+        flow_noise_std=args.flow_noise_std,
+        flow_base_scale_bound=args.flow_base_scale_bound,
         cls_token_num=args.cls_token_num,
         num_classes=args.num_classes,
         grad_checkpointing=args.grad_checkpointing,
@@ -55,6 +71,14 @@ class SphereAR(nn.Module):
         patch_size,
         resolution,
         diff_batch_mul,
+        head_type="diff",
+        flow_layers=8,
+        flow_bins=16,
+        flow_hidden_mul=1.0,
+        flow_conditioner_depth=2,
+        flow_tail_bound=6.0,
+        flow_noise_std=0.01,
+        flow_base_scale_bound=2.0,
         vae_only=False,
         grad_checkpointing=False,
         cls_token_num=16,
@@ -68,8 +92,9 @@ class SphereAR(nn.Module):
         self.patch_size = patch_size
         self.num_classes = num_classes
         self.cls_token_num = cls_token_num
-        self.class_dropout_prob = class_dropout_prob
         self.latent_dim = latent_dim
+        self.head_type = head_type
+        self.class_dropout_prob = 0.0 if head_type == "flow" else class_dropout_prob
 
         self.vae = VAE(
             latent_dim=latent_dim, image_size=resolution, patch_size=patch_size
@@ -96,14 +121,31 @@ class SphereAR(nn.Module):
 
             self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=True)
             self.pos_for_diff = nn.Embedding(self.h * self.w, dim)
-            self.head = DiffHead(
-                ch_target=latent_dim,
-                ch_cond=dim,
-                ch_latent=diff_dim,
-                depth_latent=diff_layers,
-                depth_adanln=diff_adanln_layers,
-                grad_checkpointing=grad_checkpointing,
-            )
+            if head_type == "diff":
+                self.head = DiffHead(
+                    ch_target=latent_dim,
+                    ch_cond=dim,
+                    ch_latent=diff_dim,
+                    depth_latent=diff_layers,
+                    depth_adanln=diff_adanln_layers,
+                    grad_checkpointing=grad_checkpointing,
+                )
+            elif head_type == "flow":
+                flow_hidden_dim = max(64, int(diff_dim * flow_hidden_mul))
+                self.head = FlowHead(
+                    ch_target=latent_dim,
+                    ch_cond=dim,
+                    ch_latent=flow_hidden_dim,
+                    num_layers=flow_layers,
+                    num_bins=flow_bins,
+                    conditioner_depth=flow_conditioner_depth,
+                    tail_bound=flow_tail_bound,
+                    noise_std=flow_noise_std,
+                    base_scale_bound=flow_base_scale_bound,
+                    grad_checkpointing=grad_checkpointing,
+                )
+            else:
+                raise NotImplementedError(f"unknown head_type {head_type}")
             self.diff_batch_mul = diff_batch_mul
 
             patch_2d_pos = get_2d_pos(resolution, patch_size)
@@ -191,8 +233,9 @@ class SphereAR(nn.Module):
             x = x.view(-1, x.shape[-1])
             target = target.view(-1, target.shape[-1])
 
-            x = x.repeat(self.diff_batch_mul, 1)
-            target = target.repeat(self.diff_batch_mul, 1)
+            if self.head_type == "diff":
+                x = x.repeat(self.diff_batch_mul, 1)
+                target = target.repeat(self.diff_batch_mul, 1)
             loss = self.head(target, x)
             recon = None
         else:
@@ -215,36 +258,55 @@ class SphereAR(nn.Module):
         x = self.norm(x)
         return x
 
-    def head_sample(self, x, diff_pos, sample_steps, cfg_scale, cfg_schedule="linear"):
+    def head_sample(
+        self,
+        x,
+        diff_pos,
+        sample_steps,
+        cfg_scale,
+        cfg_schedule="linear",
+        temperature=1.0,
+    ):
         x = x + self.pos_for_diff.weight[diff_pos : diff_pos + 1, :]
         x = x.view(-1, x.shape[-1])
-        seq_len = self.h * self.w
-        if cfg_scale > 1.0:
-            if cfg_schedule == "constant":
-                cfg_iter = cfg_scale
-            elif cfg_schedule == "linear":
-                start = 1.0
-                cfg_iter = start + (cfg_scale - start) * diff_pos / seq_len
-            else:
-                raise NotImplementedError(f"unknown cfg_schedule {cfg_schedule}")
+        if self.head_type == "flow":
+            pred = self.head.sample(x, temperature=temperature)
         else:
-            cfg_iter = 1.0
-        pred = self.head.sample(x, num_sampling_steps=sample_steps, cfg=cfg_iter)
+            seq_len = self.h * self.w
+            if cfg_scale > 1.0:
+                if cfg_schedule == "constant":
+                    cfg_iter = cfg_scale
+                elif cfg_schedule == "linear":
+                    start = 1.0
+                    cfg_iter = start + (cfg_scale - start) * diff_pos / seq_len
+                else:
+                    raise NotImplementedError(f"unknown cfg_schedule {cfg_schedule}")
+            else:
+                cfg_iter = 1.0
+            pred = self.head.sample(x, num_sampling_steps=sample_steps, cfg=cfg_iter)
         pred = pred.view(-1, 1, pred.shape[-1])
         # Important: normalize here, for both next-token prediction and vae decoding
         pred = self.vae.normalize(pred)
         return pred
 
     @torch.no_grad()
-    def sample(self, cond, sample_steps, cfg_scale=1.0, cfg_schedule="linear"):
+    def sample(
+        self,
+        cond,
+        sample_steps=100,
+        cfg_scale=1.0,
+        cfg_schedule="linear",
+        temperature=1.0,
+    ):
         self.eval()
-        if cfg_scale > 1.0:
+        use_cfg = self.head_type == "diff" and cfg_scale > 1.0
+        if use_cfg:
             cond_null = torch.ones_like(cond) * self.num_classes
             cond_combined = torch.cat([cond, cond_null])
         else:
             cond_combined = cond
         bsz = cond_combined.shape[0]
-        act_bsz = bsz // 2 if cfg_scale > 1.0 else bsz
+        act_bsz = bsz // 2 if use_cfg else bsz
         self.enable_kv_cache(bsz)
 
         c = self.cls_embedding(cond_combined).view(bsz, self.cls_token_num, -1)
@@ -264,6 +326,7 @@ class SphereAR(nn.Module):
                 sample_steps,
                 cfg_scale,
                 cfg_schedule,
+                temperature,
             )
             all_preds.append(last_pred)
 
