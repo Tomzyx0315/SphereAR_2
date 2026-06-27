@@ -71,7 +71,7 @@ def main(args):
     ckpt_string_name = (
         os.path.basename(args.ckpt).replace(".pth", "").replace(".pt", "")
     )
-    if args.head_type == "flow":
+    if args.head_type in ("flow", "flow-sphere"):
         sampling_tag = f"temp-{args.temperature}-{args.temperature_schedule}"
     else:
         sampling_tag = f"steps-{args.sample_steps}-cfg-{args.cfg_scale}"

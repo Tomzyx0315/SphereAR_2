@@ -1,14 +1,14 @@
 # SphereAR with Conditional Flow Heads
 
-This fork adds a one-step conditional normalizing flow head for each continuous
+This fork adds one-step conditional normalizing flow heads for each continuous
 latent token. The autoregressive backbone and hyperspherical VAE stay unchanged;
-only the token prediction head can be switched from diffusion/flow matching to a
-conditional neural spline flow.
+the token prediction head can be switched from diffusion/flow matching to a
+conditional neural spline flow, or to a sphere-native projected flow.
 
 ## Method
 
 For each token, the AR transformer produces a condition vector `h_i` and the
-head models `p(z_i | z_<i, y)`. The new `FlowHead` uses:
+head models `p(z_i | z_<i, y)`. The Euclidean `FlowHead` uses:
 
 - conditional diagonal Gaussian base distribution;
 - rational-quadratic spline coupling layers;
@@ -37,7 +37,7 @@ multimodal or diffusion backbones. I did not find a public paper that matches
 this repo's exact setup: one conditional spline-flow head per 16-D SphereAR
 token.
 
-The flow path does not use classifier-free guidance. Use sampling temperature to
+The flow paths do not use classifier-free guidance. Use sampling temperature to
 trade diversity for sharpness, and optionally anneal it across token positions:
 
 ```text
@@ -78,7 +78,8 @@ decompressed.
 
 ## Train AR with Flow Head
 
-Use `--head-type flow` and pass an existing VAE checkpoint:
+Use `--head-type flow` or `--head-type flow-sphere` and pass an existing VAE
+checkpoint:
 
 ```shell
 data_path=/path/to/ILSVRC2012_img_train.tar
@@ -89,7 +90,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
 train.py --results-dir $result_path --data-path $data_path \
 --image-size 256 --model SphereAR-B --epochs 400 \
 --patch-size 16 --latent-dim 16 --trained-vae $vae_ckpt \
---head-type flow --flow-layers 8 --flow-bins 16 \
+--head-type flow-sphere --flow-layers 8 --flow-bins 16 \
 --lr 3e-4 --global-batch-size 512 --ema 0.9999
 ```
 
@@ -117,15 +118,15 @@ Checkpoints are written to `last.pt`, with `prev.pt` and periodic
 
 ## Sample
 
-Flow sampling ignores `--cfg-scale` and `--sample-steps`. Set `--temperature`
-instead:
+Flow sampling ignores `--cfg-scale` and `--sample-steps`. Set
+`--temperature` instead:
 
 ```shell
 ckpt=/path/to/flow_ar_run/last.pt
 sample_dir=/path/to/samples
 
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-sample_ddp.py --model SphereAR-B --head-type flow --ckpt $ckpt \
+sample_ddp.py --model SphereAR-B --head-type flow-sphere --ckpt $ckpt \
 --sample-dir $sample_dir --per-proc-batch-size 256 \
 --temperature 0.9 --temperature-schedule constant --to-npz
 ```
@@ -192,9 +193,9 @@ the original linear CFG schedule kept in code.
 ## Notes
 
 - Flow checkpoints are not shape-compatible with diffusion-head checkpoints.
+- `flow` and `flow-sphere` are not checkpoint-compatible with each other.
 - EMA sampling is enabled by default when the checkpoint contains `ema`; use
   `--no-ema` to sample raw weights.
-- A stricter future variant is a spherical flow on the latent manifold itself:
-  map each token to a tangent chart, run the conditional flow there, and map
-  back with the inverse chart or exp map. This is the more principled way to
-  match the VAE's spherical latent support, but it is not implemented here.
+- `flow-sphere` models the token on the sphere `S^{15}_{sqrt(16)}` with an
+  exact stereographic chart, so its likelihood lives on spherical support
+  rather than in ambient Euclidean space.

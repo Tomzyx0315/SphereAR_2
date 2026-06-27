@@ -349,6 +349,51 @@ class ConditionalSplineFlow(nn.Module):
         return x
 
 
+def _normalize_to_radius(x, radius, eps=1e-7):
+    return x * (radius / torch.clamp(x.norm(dim=-1, keepdim=True), min=eps))
+
+
+class StereographicChart(nn.Module):
+    def __init__(self, ambient_dim, radius, eps=1e-6):
+        super().__init__()
+        self.ambient_dim = ambient_dim
+        self.chart_dim = ambient_dim - 1
+        self.radius = float(radius)
+        self.eps = eps
+        self.rotation_raw = nn.Parameter(torch.zeros(ambient_dim, ambient_dim))
+
+    def _rotation(self):
+        skew = self.rotation_raw - self.rotation_raw.t()
+        return torch.matrix_exp(skew)
+
+    def _inverse_volume_logdet(self, u):
+        sq_norm = u.square().sum(dim=-1)
+        radius_sq = self.radius * self.radius
+        scale = math.log(2.0 * radius_sq) - torch.log(sq_norm + radius_sq)
+        return self.chart_dim * scale
+
+    def forward(self, x):
+        rotation = self._rotation().to(dtype=x.dtype, device=x.device)
+        x = _normalize_to_radius(x, self.radius, self.eps)
+        x_chart = x @ rotation
+        tangent = x_chart[..., :-1]
+        height = x_chart[..., -1:]
+        denom = torch.clamp(self.radius - height, min=self.eps)
+        u = self.radius * tangent / denom
+        return u, self._inverse_volume_logdet(u)
+
+    def inverse(self, u):
+        rotation = self._rotation().to(dtype=u.dtype, device=u.device)
+        radius_sq = self.radius * self.radius
+        sq_norm = u.square().sum(dim=-1, keepdim=True)
+        denom = sq_norm + radius_sq
+        tangent = 2.0 * radius_sq * u / denom
+        height = self.radius * (sq_norm - radius_sq) / denom
+        x_chart = torch.cat([tangent, height], dim=-1)
+        x = x_chart @ rotation.t()
+        return _normalize_to_radius(x, self.radius, self.eps)
+
+
 class FlowHead(nn.Module):
     def __init__(
         self,
@@ -390,6 +435,67 @@ class FlowHead(nn.Module):
     def sample(self, z, temperature=1.0):
         with torch.autocast(device_type=z.device.type, enabled=False):
             return self.flow.sample(z.float(), temperature=temperature)
+
+    def initialize_weights(self):
+        self.flow.initialize_weights()
+
+
+class SphericalFlowHead(nn.Module):
+    def __init__(
+        self,
+        ch_target,
+        ch_cond,
+        ch_latent,
+        num_layers=8,
+        num_bins=16,
+        conditioner_depth=2,
+        tail_bound=6.0,
+        noise_std=0.0,
+        base_scale_bound=2.0,
+        grad_checkpointing=False,
+    ):
+        super().__init__()
+        del grad_checkpointing
+        if ch_target < 2:
+            raise ValueError("SphericalFlowHead requires ch_target >= 2")
+        self.ch_target = ch_target
+        self.radius = math.sqrt(ch_target)
+        self.noise_std = noise_std
+        self.chart = StereographicChart(ch_target, self.radius)
+        self.flow = ConditionalSplineFlow(
+            dim=ch_target - 1,
+            cond_dim=ch_cond,
+            hidden_dim=ch_latent,
+            num_layers=num_layers,
+            num_bins=num_bins,
+            conditioner_depth=conditioner_depth,
+            tail_bound=tail_bound,
+            base_scale_bound=base_scale_bound,
+        )
+
+    def _add_tangent_noise(self, target):
+        if self.noise_std <= 0.0 or not self.training:
+            return target
+        unit = _normalize_to_radius(target, 1.0)
+        noise = torch.randn_like(target)
+        noise = noise - (noise * unit).sum(dim=-1, keepdim=True) * unit
+        target = target + self.noise_std * noise
+        return _normalize_to_radius(target, self.radius)
+
+    def forward(self, target, z):
+        with torch.autocast(device_type=target.device.type, enabled=False):
+            target = _normalize_to_radius(target.float(), self.radius)
+            target = self._add_tangent_noise(target)
+            z = z.float()
+            chart_target, log_chart_volume = self.chart(target)
+            log_prob = self.flow.log_prob(chart_target, z) - log_chart_volume
+            loss = -log_prob.mean()
+        return loss
+
+    def sample(self, z, temperature=1.0):
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            chart_sample = self.flow.sample(z.float(), temperature=temperature)
+            return self.chart.inverse(chart_sample)
 
     def initialize_weights(self):
         self.flow.initialize_weights()

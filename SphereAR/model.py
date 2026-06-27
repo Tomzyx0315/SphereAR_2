@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .diff_head import DiffHead
-from .flow_head import FlowHead
+from .flow_head import FlowHead, SphericalFlowHead
 from .layers import TransformerBlock, get_2d_pos, precompute_freqs_cis_2d
 from .vae import VAE
 
@@ -22,7 +22,12 @@ def get_model_args():
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cls-token-num", type=int, default=16)
     parser.add_argument("--latent-dim", type=int, default=16)
-    parser.add_argument("--head-type", type=str, default="diff", choices=["diff", "flow"])
+    parser.add_argument(
+        "--head-type",
+        type=str,
+        default="diff",
+        choices=["diff", "flow", "flow-sphere"],
+    )
     parser.add_argument("--diff-batch-mul", type=int, default=4)
     parser.add_argument("--flow-layers", type=int, default=8)
     parser.add_argument("--flow-bins", type=int, default=16)
@@ -94,7 +99,9 @@ class SphereAR(nn.Module):
         self.cls_token_num = cls_token_num
         self.latent_dim = latent_dim
         self.head_type = head_type
-        self.class_dropout_prob = 0.0 if head_type == "flow" else class_dropout_prob
+        self.class_dropout_prob = (
+            0.0 if head_type in ("flow", "flow-sphere") else class_dropout_prob
+        )
 
         self.vae = VAE(
             latent_dim=latent_dim, image_size=resolution, patch_size=patch_size
@@ -133,6 +140,20 @@ class SphereAR(nn.Module):
             elif head_type == "flow":
                 flow_hidden_dim = max(64, int(diff_dim * flow_hidden_mul))
                 self.head = FlowHead(
+                    ch_target=latent_dim,
+                    ch_cond=dim,
+                    ch_latent=flow_hidden_dim,
+                    num_layers=flow_layers,
+                    num_bins=flow_bins,
+                    conditioner_depth=flow_conditioner_depth,
+                    tail_bound=flow_tail_bound,
+                    noise_std=flow_noise_std,
+                    base_scale_bound=flow_base_scale_bound,
+                    grad_checkpointing=grad_checkpointing,
+                )
+            elif head_type == "flow-sphere":
+                flow_hidden_dim = max(64, int(diff_dim * flow_hidden_mul))
+                self.head = SphericalFlowHead(
                     ch_target=latent_dim,
                     ch_cond=dim,
                     ch_latent=flow_hidden_dim,
@@ -270,7 +291,7 @@ class SphereAR(nn.Module):
     ):
         x = x + self.pos_for_diff.weight[diff_pos : diff_pos + 1, :]
         x = x.view(-1, x.shape[-1])
-        if self.head_type == "flow":
+        if self.head_type in ("flow", "flow-sphere"):
             seq_len = self.h * self.w
             if temperature_schedule == "constant":
                 temp_iter = temperature
