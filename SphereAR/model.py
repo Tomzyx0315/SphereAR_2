@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -225,9 +226,25 @@ class SphereAR(nn.Module):
         self,
         images,
         class_id,
+        self_forcing=False,
+        self_forcing_temperature=1.0,
+        self_forcing_temperature_schedule="constant",
+        self_forcing_detach_history=True,
     ):
 
         vae_latent, kl_loss = self.vae.encode(images)
+
+        if self_forcing:
+            if self.vae_only:
+                raise ValueError("self-forcing is not supported in VAE-only mode.")
+            loss = self.flow_self_forcing_loss(
+                vae_latent.detach(),
+                class_id,
+                temperature=self_forcing_temperature,
+                temperature_schedule=self_forcing_temperature_schedule,
+                detach_history=self_forcing_detach_history,
+            )
+            return loss, kl_loss, None
 
         if not self.vae_only:
             x = vae_latent.detach()
@@ -269,8 +286,11 @@ class SphereAR(nn.Module):
         for layer in self.layers:
             layer.attention.enable_kv_cache(bsz, self.total_tokens)
 
-    @torch.compile()
-    def forward_model(self, x, start_pos, end_pos):
+    def set_kv_cache_detach(self, detach):
+        for layer in self.layers:
+            layer.attention.detach_kv_cache = detach
+
+    def forward_model_uncompiled(self, x, start_pos, end_pos):
         x = self.emb_norm(x)
         for layer in self.layers:
             x = layer.forward_onestep(
@@ -278,6 +298,72 @@ class SphereAR(nn.Module):
             )
         x = self.norm(x)
         return x
+
+    @torch.compile()
+    def forward_model(self, x, start_pos, end_pos):
+        return self.forward_model_uncompiled(x, start_pos, end_pos)
+
+    def _temperature_at_pos(self, diff_pos, temperature, temperature_schedule):
+        if temperature_schedule == "constant":
+            return temperature
+        if temperature_schedule == "linear":
+            seq_len = self.h * self.w
+            return 1.0 + (temperature - 1.0) * diff_pos / seq_len
+        raise NotImplementedError(f"unknown temperature_schedule {temperature_schedule}")
+
+    def flow_self_forcing_loss(
+        self,
+        target_latent,
+        class_id,
+        temperature=1.0,
+        temperature_schedule="constant",
+        detach_history=True,
+    ):
+        if self.head_type != "flow":
+            raise ValueError("--self-forcing currently supports only --head-type flow.")
+
+        bsz = class_id.shape[0]
+        self.enable_kv_cache(bsz)
+        old_detach_cache = self.layers[0].attention.detach_kv_cache
+        self.set_kv_cache_detach(detach_history)
+
+        class_id = self.drop_label(class_id)
+        class_tokens = self.cls_embedding(class_id).view(bsz, self.cls_token_num, -1)
+        last_pred = None
+        losses = []
+
+        try:
+            for pos in range(self.h * self.w):
+                if pos == 0:
+                    x = self.forward_model_uncompiled(
+                        class_tokens, 0, self.cls_token_num
+                    )
+                else:
+                    ar_token = self.proj_in(last_pred)
+                    x = self.forward_model_uncompiled(
+                        ar_token,
+                        pos + self.cls_token_num - 1,
+                        pos + self.cls_token_num,
+                    )
+
+                cond = x[:, -1:, :] + self.pos_for_diff.weight[pos : pos + 1, :]
+                cond = cond.view(-1, cond.shape[-1])
+                target = target_latent[:, pos, :]
+                losses.append(self.head(target, cond))
+
+                temp_iter = self._temperature_at_pos(
+                    pos, temperature, temperature_schedule
+                )
+                sample_context = torch.no_grad() if detach_history else nullcontext()
+                with sample_context:
+                    pred = self.head.sample(cond, temperature=temp_iter)
+                    pred = pred.view(bsz, 1, pred.shape[-1])
+                    pred = self.vae.normalize(pred)
+                last_pred = pred.detach() if detach_history else pred
+        finally:
+            self.set_kv_cache_detach(old_detach_cache)
+
+        return torch.stack(losses).mean()
 
     def head_sample(
         self,
@@ -292,16 +378,9 @@ class SphereAR(nn.Module):
         x = x + self.pos_for_diff.weight[diff_pos : diff_pos + 1, :]
         x = x.view(-1, x.shape[-1])
         if self.head_type in ("flow", "flow-sphere"):
-            seq_len = self.h * self.w
-            if temperature_schedule == "constant":
-                temp_iter = temperature
-            elif temperature_schedule == "linear":
-                start = 1.0
-                temp_iter = start + (temperature - start) * diff_pos / seq_len
-            else:
-                raise NotImplementedError(
-                    f"unknown temperature_schedule {temperature_schedule}"
-                )
+            temp_iter = self._temperature_at_pos(
+                diff_pos, temperature, temperature_schedule
+            )
             pred = self.head.sample(x, temperature=temp_iter)
         else:
             seq_len = self.h * self.w

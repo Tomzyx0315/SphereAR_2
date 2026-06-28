@@ -27,15 +27,6 @@ This design follows the normalizing-flow line of work behind
 it here is that each head only models a 16-dimensional token, where expressive
 spline flows are cheap and avoid the multi-step diffusion sampler.
 
-Recent adjacent work points in a similar direction:
-[TarFlow](https://arxiv.org/abs/2412.06329) and
-[STARFlow](https://arxiv.org/abs/2506.06276) scale transformer autoregressive
-flows for images; [Jet](https://arxiv.org/abs/2412.15129) revisits
-transformer-based flows; [Show-o2](https://arxiv.org/abs/2506.15564) and
-[TMD](https://arxiv.org/abs/2601.09881) attach flow heads to larger
-multimodal or diffusion backbones. I did not find a public paper that matches
-this repo's exact setup: one conditional spline-flow head per 16-D SphereAR
-token.
 
 The flow paths do not use classifier-free guidance. Use sampling temperature to
 trade diversity for sharpness, and optionally anneal it across token positions:
@@ -90,16 +81,20 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
 train.py --results-dir $result_path --data-path $data_path \
 --image-size 256 --model SphereAR-B --epochs 400 \
 --patch-size 16 --latent-dim 16 --trained-vae $vae_ckpt \
---head-type flow-sphere --flow-layers 8 --flow-bins 16 \
---lr 3e-4 --global-batch-size 512 --ema 0.9999
+--head-type flow --flow-layers 8 --flow-bins 16 \
+--lr 3e-4 --global-batch-size 512 --ema 0.9999 \
+--preview-every-steps 1000 --preview-num-samples 16 \
+--preview-temperature 0.9 --preview-temperature-schedule constant
 ```
 
-Useful flow options:
+Shared training options such as `--model`, `--latent-dim`, `--patch-size`,
+`--lr`, `--global-batch-size`, `--ema`, and augmentation decay are unchanged.
+The flow head adds these options:
 
 ```text
 --flow-layers              number of spline coupling blocks
 --flow-bins                rational-quadratic spline bins
---flow-hidden-mul          flow hidden dim multiplier over model diff_dim
+--flow-hidden-mul          multiplier over the model's head hidden width
 --flow-conditioner-depth   residual MLP depth inside each conditioner
 --flow-tail-bound          spline interval is [-bound, bound]
 --flow-noise-std           training dequantization noise on target latents
@@ -126,7 +121,7 @@ ckpt=/path/to/flow_ar_run/last.pt
 sample_dir=/path/to/samples
 
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-sample_ddp.py --model SphereAR-B --head-type flow-sphere --ckpt $ckpt \
+sample_ddp.py --model SphereAR-B --head-type flow --ckpt $ckpt \
 --sample-dir $sample_dir --per-proc-batch-size 256 \
 --temperature 0.9 --temperature-schedule constant --to-npz
 ```
@@ -178,6 +173,51 @@ Useful preview options:
 
 Preview sampling follows the same head-specific rules as full sampling: flow
 uses temperature, diffusion uses CFG.
+
+## Self-Forcing Finetuning
+
+`--self-forcing` is a second-stage finetuning mode for a trained `flow` head.
+The model rolls out its own latent prefix with the same single-step sampler used
+at inference, then maximizes the exact flow likelihood of the real next VAE
+token:
+
+```text
+teacher-forced loss: p(z_i | z_<i real, y)
+self-forced loss:   p(z_i | z_<i generated, y)
+```
+
+This mode does not use CFG, diffusion sampling, or diffusion truncation. The
+rollout temperature is controlled by:
+
+```text
+--self-forcing-temperature
+--self-forcing-temperature-schedule constant|linear
+```
+
+Start it from a completed flow checkpoint:
+
+```shell
+stage1_ckpt=/path/to/flow_ar_run/last.pt
+self_forcing_dir=/path/to/flow_self_forcing_run
+
+torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
+train.py --results-dir $self_forcing_dir --data-path $data_path \
+--image-size 256 --model SphereAR-B --epochs 40 \
+--patch-size 16 --latent-dim 16 --head-type flow \
+--flow-layers 8 --flow-bins 16 --init-from $stage1_ckpt \
+--self-forcing --self-forcing-temperature 0.9 \
+--self-forcing-temperature-schedule constant \
+--lr 5e-5 --global-batch-size 256 --ema 0.9999 --no-compile \
+--preview-every-steps 1000 --preview-num-samples 16 \
+--preview-temperature 0.9 --preview-temperature-schedule constant
+```
+
+Use a smaller learning rate than stage 1 for this finetune; `3e-5` to `1e-4`
+is a reasonable first sweep.
+
+Generated prefix tokens and previous KV cache entries are detached by default to
+keep memory bounded. Use `--no-self-forcing-detach-history` only for the
+full-history-gradient ablation.
 
 ## Diffusion Head Baseline
 

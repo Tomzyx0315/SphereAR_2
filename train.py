@@ -306,6 +306,13 @@ def copy_ckp_func(src_file, dest_path, cur_epoch, keep_freq):
 
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    if args.self_forcing:
+        if args.vae_only:
+            raise ValueError("--self-forcing cannot be used with --vae-only.")
+        if args.head_type != "flow":
+            raise ValueError("--self-forcing currently supports only --head-type flow.")
+        if not args.no_compile:
+            args.no_compile = True
 
     # Setup DDP:
     device = init_distributed_mode(args)
@@ -428,6 +435,15 @@ def main(args):
     else:
         train_steps = 0
         start_epoch = 0
+        if args.init_from != "":
+            checkpoint = torch.load(args.init_from, map_location="cpu", weights_only=False)
+            if "model" in checkpoint:
+                model_weight = checkpoint["model"]
+            else:
+                model_weight = checkpoint
+            model.load_state_dict(model_weight, strict=True)
+            del checkpoint
+            logger.info(f"Initialized model weights from {args.init_from}")
         if args.ema > 0:
             update_ema(ema_model, model, decay=0)
 
@@ -436,6 +452,8 @@ def main(args):
         model = torch.compile(model)  # requires PyTorch 2.0
         if args.vae_only:
             gan_model = torch.compile(gan_model)
+    elif args.self_forcing:
+        logger.info("Skipped torch.compile for self-forcing KV-cache training.")
 
     model = DDP(model.to(device), device_ids=[args.gpu])
     model.train()
@@ -471,7 +489,14 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=ptdtype):
-                ar_loss, kl_loss, recon = model(images, classes)
+                ar_loss, kl_loss, recon = model(
+                    images,
+                    classes,
+                    self_forcing=args.self_forcing,
+                    self_forcing_temperature=args.self_forcing_temperature,
+                    self_forcing_temperature_schedule=args.self_forcing_temperature_schedule,
+                    self_forcing_detach_history=args.self_forcing_detach_history,
+                )
                 gan_g_loss, running_loss_dict = vae_loss(
                     args,
                     gan_model,
@@ -482,7 +507,10 @@ def main(args):
                     running_loss_dict,
                 )
             if not args.vae_only:
-                running_loss_dict = update_loss_dict(running_loss_dict, loss=ar_loss)
+                loss_name = "self_forcing_loss" if args.self_forcing else "loss"
+                running_loss_dict = update_loss_dict(
+                    running_loss_dict, **{loss_name: ar_loss}
+                )
             loss = ar_loss + gan_g_loss
             loss.backward()
 
@@ -606,6 +634,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--tmp-results-dir", type=str, default="/dev/shm/")
     parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default="",
+        help="Initialize model weights from a checkpoint when results-dir has no last.pt.",
+    )
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -636,6 +670,31 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mixed-precision", type=str, default="bf16", choices=["none", "bf16"]
+    )
+    parser.add_argument(
+        "--self-forcing",
+        action="store_true",
+        help="Finetune a trained flow head with autoregressively generated prefixes.",
+    )
+    parser.add_argument("--self-forcing-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--self-forcing-temperature-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+    )
+    parser.add_argument(
+        "--self-forcing-detach-history",
+        dest="self_forcing_detach_history",
+        action="store_true",
+        default=True,
+        help="Detach generated prefix tokens and previous KV cache during self-forcing.",
+    )
+    parser.add_argument(
+        "--no-self-forcing-detach-history",
+        dest="self_forcing_detach_history",
+        action="store_false",
+        help="Allow gradients through generated prefix tokens and previous KV cache.",
     )
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-loss", type=str, default="l1")
